@@ -1,0 +1,915 @@
+﻿using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using System.Collections.Immutable;
+using System.Runtime.InteropServices.ComTypes;
+using System.Security.Cryptography;
+using System.Xml.Linq;
+
+namespace ConsoleAppFramework;
+
+internal class Parser(ConsoleAppFrameworkGeneratorOptions generatorOptions, DiagnosticReporter context, SyntaxNode node, SemanticModel model, WellKnownTypes wellKnownTypes, DelegateBuildType delegateBuildType, FilterInfo[] globalFilters)
+{
+    public Command? ParseAndValidateForRun() // for ConsoleApp.Run, lambda or method or &method
+    {
+        var args = (node as InvocationExpressionSyntax)!.ArgumentList.Arguments;
+        if (args.Count == 2) // 0 = args, 1 = lambda
+        {
+            var command = ExpressionToCommand(args[1].Expression, ""); // rootCommand(commandName = "")
+            if (command != null)
+            {
+                return ValidateCommand(command);
+            }
+            return null;
+        }
+
+        context.ReportDiagnostic(DiagnosticDescriptors.RequireArgsAndMethod, node.GetLocation());
+        return null;
+    }
+
+    public Command? ParseAndValidateForBuilderDelegateRegistration() // for ConsoleAppBuilder.Add
+    {
+        // Add(string commandName, Delegate command)
+        var args = (node as InvocationExpressionSyntax)!.ArgumentList.Arguments;
+        if (args.Count == 2) // 0 = string command, 1 = lambda
+        {
+            var commandName = args[0];
+
+            if (!commandName.Expression.IsKind(SyntaxKind.StringLiteralExpression))
+            {
+                context.ReportDiagnostic(DiagnosticDescriptors.AddCommandMustBeStringLiteral, commandName.GetLocation());
+                return null;
+            }
+
+            var name = (commandName.Expression as LiteralExpressionSyntax)!.Token.ValueText;
+            var command = ExpressionToCommand(args[1].Expression, name);
+            if (command != null)
+            {
+                return ValidateCommand(command);
+            }
+            return null;
+        }
+
+        return null;
+    }
+
+    public Command?[] ParseAndValidateForBuilderClassRegistration()
+    {
+        var node2 = (node as InvocationExpressionSyntax)!;
+        // Add<T>
+        var genericName = (node2.Expression as MemberAccessExpressionSyntax)?.Name as GenericNameSyntax;
+        var genericType = genericName!.TypeArgumentList.Arguments[0];
+
+        // Add<T>(string commandPath)
+        string? commandPath = null;
+        var args = node2.ArgumentList.Arguments;
+        if (node2.ArgumentList.Arguments.Count == 1)
+        {
+            var commandName = args[0];
+            if (!commandName.Expression.IsKind(SyntaxKind.StringLiteralExpression))
+            {
+                context.ReportDiagnostic(DiagnosticDescriptors.AddCommandMustBeStringLiteral, commandName.GetLocation());
+                return [];
+            }
+
+            commandPath = (commandName.Expression as LiteralExpressionSyntax)!.Token.ValueText;
+        }
+
+        // T
+        var type = model.GetTypeInfo(genericType).Type!;
+
+        return CreateCommandsFromType(type, commandPath);
+    }
+
+    public Command?[] CreateCommandsFromType(ITypeSymbol type, string? commandPath)
+    {
+        if (type.IsStatic || type.IsAbstract)
+        {
+            context.ReportDiagnostic(DiagnosticDescriptors.ClassIsStaticOrAbstract, node.GetLocation());
+            return [];
+        }
+
+        if (type.DeclaringSyntaxReferences.Length == 0)
+        {
+            context.ReportDiagnostic(DiagnosticDescriptors.DefinedInOtherProject, node.GetLocation());
+            return [];
+        }
+
+        var publicMethods = type.GetMembers()
+            .Where(x => x.DeclaredAccessibility == Accessibility.Public)
+            .OfType<IMethodSymbol>()
+            .Where(x => x.DeclaredAccessibility == Accessibility.Public && !x.IsStatic)
+            .Where(x => x.MethodKind == Microsoft.CodeAnalysis.MethodKind.Ordinary)
+            .Where(x => !(x.Name is "Dispose" or "DisposeAsync" or "GetHashCode" or "Equals" or "ToString"))
+            .ToArray();
+
+        var publicConstructors = type.GetMembers()
+           .OfType<IMethodSymbol>()
+           .Where(x => x.MethodKind == Microsoft.CodeAnalysis.MethodKind.Constructor && x.DeclaredAccessibility == Accessibility.Public)
+           .ToArray();
+
+        if (publicMethods.Length == 0)
+        {
+            context.ReportDiagnostic(DiagnosticDescriptors.ClassHasNoPublicMethods, node.GetLocation());
+            return [];
+        }
+
+        if (publicConstructors.Length != 1)
+        {
+            context.ReportDiagnostic(DiagnosticDescriptors.ClassMultipleConstructor, node.GetLocation());
+            return [];
+        }
+
+        var hasIDisposable = type.AllInterfaces.Any(x => SymbolEqualityComparer.Default.Equals(x, wellKnownTypes.IDisposable));
+        var hasIAsyncDisposable = type.AllInterfaces.Any(x => SymbolEqualityComparer.Default.Equals(x, wellKnownTypes.IAsyncDisposable));
+
+        var typeFilters = type.GetAttributes()
+            .Where(x => x.AttributeClass?.Name == "ConsoleAppFilterAttribute")
+            .Select(x =>
+            {
+                var filterType = x.AttributeClass!.TypeArguments[0];
+                var filter = FilterInfo.Create(filterType);
+
+                if (filter == null)
+                {
+                    context.ReportDiagnostic(DiagnosticDescriptors.FilterMultipleConstructor, x.ApplicationSyntaxReference!.GetSyntax().GetLocation());
+                    return null!;
+                }
+
+                return filter;
+            })
+            .ToArray();
+        if (typeFilters.Any(x => x == null))
+        {
+            return [];
+        }
+
+        var methodInfoBase = new CommandMethodInfo
+        {
+            TypeFullName = type.ToFullyQualifiedFormatDisplayString(),
+            IsIDisposable = hasIDisposable,
+            IsIAsyncDisposable = hasIAsyncDisposable,
+            ConstructorParameterTypes = publicConstructors[0].Parameters.Select(x => new EquatableTypeSymbolWithKeyedServiceKey(x)).ToArray(),
+            MethodName = "", // without method name
+        };
+
+        return publicMethods
+            .Select(x =>
+            {
+                string commandName;
+                var commandAttribute = x.GetAttributes().FirstOrDefault(x => x.AttributeClass?.Name == "CommandAttribute");
+                if (commandAttribute != null)
+                {
+                    commandName = (commandAttribute.ConstructorArguments[0].Value as string)!;
+                }
+                else
+                {
+                    commandName = generatorOptions.DisableNamingConversion ? x.Name : NameConverter.ToKebabCase(x.Name);
+                }
+
+                var command = ParseFromMethodSymbol(x, false, (commandPath == null) ? commandName : $"{commandPath.Trim()} {commandName}", typeFilters);
+                if (command == null) return null;
+                command = ValidateCommand(command);
+                if (command == null) return null;
+
+                command.CommandMethodInfo = methodInfoBase with { MethodName = x.Name };
+                return command;
+            })
+            .ToArray();
+    }
+
+    public GlobalOptionInfo[] ParseGlobalOptions()
+    {
+        var lambdaExpr = (node as InvocationExpressionSyntax);
+        if (lambdaExpr == null) return [];
+
+        var addOptions = node
+            .DescendantNodes()
+            .OfType<InvocationExpressionSyntax>()
+            .Select(x =>
+            {
+                var expr = x.Expression as MemberAccessExpressionSyntax;
+                var methodName = expr?.Name.Identifier.Text;
+                if (methodName is "AddGlobalOption")
+                {
+                    return new { node = x, expr, required = false };
+                }
+                else if (methodName is "AddRequiredGlobalOption")
+                {
+                    return new { node = x, expr, required = true };
+                }
+
+                return null;
+            })
+            .Where(x => x != null);
+
+        var result = addOptions
+            .Select(x =>
+            {
+                var node = x!.node;
+                var memberAccess = x.expr!;
+                var symbolInfo = model.GetSymbolInfo(memberAccess).Symbol as IMethodSymbol;
+
+                var typeSymbol = symbolInfo!.TypeArguments[0];
+
+                if (!IsParsableType(typeSymbol))
+                {
+                    context.ReportDiagnostic(DiagnosticDescriptors.InvalidGlobalOptionsType, node.GetLocation());
+                    return null!;
+                }
+
+                object? name = "";
+                object? description = "";
+                object? defaultValue = GetDefaultValue(typeSymbol);
+
+                var arguments = node.ArgumentList;
+
+                if (!x.required)
+                {
+                    // public T AddGlobalOption<T>([ConstantExpected] string name, [ConstantExpected] string description = "", [ConstantExpected] T defaultValue = default(T))
+                    node.ArgumentList.GetConstantValues(model, "name", "description", "defaultValue", ref name, ref description, ref defaultValue);
+                }
+                else
+                {
+                    // public T AddRequiredGlobalOption<T>([ConstantExpected] string name, [ConstantExpected] string description = "")
+                    node.ArgumentList.GetConstantValues(model, "name", "description", ref name, ref description);
+                }
+
+                return new GlobalOptionInfo
+                {
+                    Type = new(typeSymbol),
+                    IsRequired = x.required,
+                    Name = (string)name!,
+                    Description = (string)description!,
+                    DefaultValue = defaultValue
+                };
+            })
+            .Where(x => x != null)
+            .ToArray();
+
+        return result;
+
+        // GlobalOptions allow type is limited(C# compile-time constant only)
+        // bool, char, sbyte, byte, short, ushort, int, uint, long, ulong, float, double, decimal
+        // string
+        // null
+        // enum
+        // Nullable<T>
+        bool IsParsableType(ITypeSymbol type)
+        {
+            if (type is INamedTypeSymbol { IsValueType: true, OriginalDefinition.SpecialType: SpecialType.System_Nullable_T } namedType)
+            {
+                var underlyingType = namedType.TypeArguments[0];
+                return IsParsableType(underlyingType);
+            }
+
+            switch (type.SpecialType)
+            {
+                case SpecialType.System_Boolean:
+                case SpecialType.System_Char:
+                case SpecialType.System_SByte:
+                case SpecialType.System_Byte:
+                case SpecialType.System_Int16:
+                case SpecialType.System_UInt16:
+                case SpecialType.System_Int32:
+                case SpecialType.System_UInt32:
+                case SpecialType.System_Int64:
+                case SpecialType.System_UInt64:
+                case SpecialType.System_Single:
+                case SpecialType.System_Double:
+                case SpecialType.System_Decimal:
+                case SpecialType.System_String:
+                    return true;
+            }
+
+            if (type.TypeKind == TypeKind.Enum)
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        object? GetDefaultValue(ITypeSymbol type)
+        {
+            if (type is INamedTypeSymbol { IsValueType: true, OriginalDefinition.SpecialType: SpecialType.System_Nullable_T } namedType)
+            {
+                return null;
+            }
+
+            switch (type.SpecialType)
+            {
+                case SpecialType.System_Boolean: return false;
+                case SpecialType.System_Char: return '\0';
+                case SpecialType.System_SByte: return (sbyte)0;
+                case SpecialType.System_Byte: return (byte)0;
+                case SpecialType.System_Int16: return (short)0;
+                case SpecialType.System_UInt16: return (ushort)0;
+                case SpecialType.System_Int32: return 0;
+                case SpecialType.System_UInt32: return 0u;
+                case SpecialType.System_Int64: return 0L;
+                case SpecialType.System_UInt64: return 0UL;
+                case SpecialType.System_Single: return 0f;
+                case SpecialType.System_Double: return 0d;
+                case SpecialType.System_Decimal: return 0m;
+                case SpecialType.System_String: return null;
+                default:
+                    break;
+            }
+
+            if (type.TypeKind == TypeKind.Enum)
+            {
+                var enumType = (INamedTypeSymbol)type;
+                var underlyingType = enumType.EnumUnderlyingType;
+                return underlyingType?.SpecialType switch
+                {
+                    SpecialType.System_Byte => (byte)0,
+                    SpecialType.System_SByte => (sbyte)0,
+                    SpecialType.System_Int16 => (short)0,
+                    SpecialType.System_UInt16 => (ushort)0,
+                    SpecialType.System_Int32 => 0,
+                    SpecialType.System_UInt32 => 0u,
+                    SpecialType.System_Int64 => 0L,
+                    SpecialType.System_UInt64 => 0UL,
+                    _ => 0
+                };
+            }
+
+            return null;
+        }
+    }
+
+    Command? ExpressionToCommand(ExpressionSyntax expression, string commandName)
+    {
+        var lambda = expression as ParenthesizedLambdaExpressionSyntax;
+        if (lambda == null)
+        {
+            if (expression.IsKind(SyntaxKind.AddressOfExpression))
+            {
+                var operand = (expression as PrefixUnaryExpressionSyntax)!.Operand;
+
+                var methodSymbols = model.GetMemberGroup(operand);
+                if (methodSymbols.Length > 0 && methodSymbols[0] is IMethodSymbol methodSymbol)
+                {
+                    return ParseFromMethodSymbol(methodSymbol, addressOf: true, commandName, []);
+                }
+            }
+            else
+            {
+                var methodSymbols = model.GetMemberGroup(expression);
+                if (methodSymbols.Length > 0 && methodSymbols[0] is IMethodSymbol methodSymbol)
+                {
+                    var cmd = ParseFromMethodSymbol(methodSymbol, addressOf: false, commandName, []);
+                    if (cmd != null)
+                    {
+                        cmd.IsRequireDynamicDependencyAttribute = true;
+                    }
+                    return cmd;
+                }
+            }
+        }
+        else
+        {
+            return ParseFromLambda(lambda, commandName);
+        }
+
+        return null;
+    }
+
+    Command? ParseFromLambda(ParenthesizedLambdaExpressionSyntax lambda, string commandName)
+    {
+        var isAsync = lambda.AsyncKeyword.IsKind(SyntaxKind.AsyncKeyword);
+
+        var isVoid = lambda.ReturnType == null;
+        if (!isVoid)
+        {
+            if (!isAsync)
+            {
+                var keyword = (lambda.ReturnType as PredefinedTypeSyntax)?.Keyword;
+                if (keyword != null && keyword.Value.IsKind(SyntaxKind.VoidKeyword))
+                {
+                    isVoid = true;
+                }
+                else if (keyword != null && keyword.Value.IsKind(SyntaxKind.IntKeyword))
+                {
+                    isVoid = false; // ok
+                }
+                else
+                {
+                    context.ReportDiagnostic(DiagnosticDescriptors.ReturnTypeLambda, lambda.ReturnType!.GetLocation(), lambda.ReturnType);
+                    return null;
+                }
+            }
+            else
+            {
+                if (!(lambda.ReturnType?.ToString() is "Task" or "Task<int>"))
+                {
+                    context.ReportDiagnostic(DiagnosticDescriptors.ReturnTypeLambda, lambda.ReturnType!.GetLocation(), lambda.ReturnType);
+                    return null;
+                }
+
+                var firstType = (lambda.ReturnType as GenericNameSyntax)?.TypeArgumentList.Arguments.FirstOrDefault();
+                if (firstType == null)
+                {
+                    isVoid = true;
+                }
+                else if ((firstType as PredefinedTypeSyntax)?.Keyword.IsKind(SyntaxKind.IntKeyword) ?? false)
+                {
+                    isVoid = false;
+                }
+                else
+                {
+                    context.ReportDiagnostic(DiagnosticDescriptors.ReturnTypeLambda, lambda.ReturnType!.GetLocation(), lambda.ReturnType);
+                    return null;
+                }
+            }
+        }
+
+        var parsableIndex = 0;
+        var argumentIndexCounter = 0;
+        var parameters = lambda.ParameterList.Parameters
+            .Where(x => x.Type != null)
+            .Select(x =>
+            {
+                var type = model.GetTypeInfo(x.Type!);
+
+                var hasDefault = x.Default != null;
+                object? defaultValue = null;
+                if (x.Default?.Value is LiteralExpressionSyntax literal)
+                {
+                    var token = literal.Token;
+                    if (token.IsKind(SyntaxKind.DefaultKeyword))
+                    {
+                        defaultValue = null;
+                    }
+                    else
+                    {
+                        defaultValue = token.Value;
+                    }
+                }
+                else if (x.Default != null)
+                {
+                    var value = model.GetConstantValue(x.Default.Value);
+                    if (value.HasValue)
+                    {
+                        defaultValue = value.Value;
+                    }
+                }
+
+                var hasParams = x.Modifiers.Any(x => x.IsKind(SyntaxKind.ParamsKeyword));
+
+                var isHidden = x.AttributeLists
+                                .SelectMany(x => x.Attributes)
+                                .Any(x => model.GetTypeInfo(x).Type?.Name == "HiddenAttribute");
+
+                var isDefaultValueHidden = x.AttributeLists
+                                .SelectMany(x => x.Attributes)
+                                .Any(x => model.GetTypeInfo(x).Type?.Name == "HideDefaultValueAttribute");
+
+                var customParserType = x.AttributeLists.SelectMany(x => x.Attributes)
+                    .Select(x =>
+                    {
+                        var attr = model.GetTypeInfo(x).Type;
+                        if (attr != null && attr.AllInterfaces.Any(x => x.Name == "IArgumentParser"))
+                        {
+                            return attr;
+                        }
+                        return null;
+                    })
+                    .FirstOrDefault(x => x != null);
+
+                var hasValidation = x.AttributeLists.SelectMany(x => x.Attributes)
+                    .Any(x =>
+                    {
+                        var attr = model.GetTypeInfo(x).Type as INamedTypeSymbol;
+                        if (attr != null && attr.GetBaseTypes().Any(x => x.Name == "ValidationAttribute"))
+                        {
+                            return true;
+                        }
+                        return false;
+                    });
+
+                var isFromServices = x.AttributeLists.SelectMany(x => x.Attributes)
+                    .Any(x =>
+                    {
+                        var name = x.Name;
+                        if (x.Name is QualifiedNameSyntax qns)
+                        {
+                            name = qns.Right;
+                        }
+
+                        var identifier = name.ToString();
+                        return identifier is "FromServices" or "FromServicesAttribute";
+                    });
+
+                object? keyedServiceKey = null;
+                var isFromKeyedServices = x.AttributeLists.SelectMany(x => x.Attributes)
+                    .Any(x =>
+                    {
+                        var name = x.Name;
+                        if (x.Name is QualifiedNameSyntax qns)
+                        {
+                            name = qns.Right;
+                        }
+
+                        var identifier = name.ToString();
+                        var result = identifier is "FromKeyedServices" or "FromKeyedServicesAttribute";
+                        if (result)
+                        {
+                            SemanticModel semanticModel = model; // we can use SemanticModel
+                            if (x.ArgumentList?.Arguments.Count > 0)
+                            {
+                                var argumentExpression = x.ArgumentList.Arguments[0].Expression;
+
+                                var constantValue = semanticModel.GetConstantValue(argumentExpression);
+                                if (constantValue.HasValue)
+                                {
+                                    keyedServiceKey = constantValue.Value;
+                                }
+                                else if (argumentExpression is TypeOfExpressionSyntax typeOf)
+                                {
+                                    var typeInfo = semanticModel.GetTypeInfo(typeOf.Type);
+                                    keyedServiceKey = typeInfo.Type;
+                                }
+                            }
+                        }
+                        return result;
+                    });
+
+                var hasArgument = x.AttributeLists.SelectMany(x => x.Attributes)
+                    .Any(x =>
+                    {
+                        var name = x.Name;
+                        if (x.Name is QualifiedNameSyntax qns)
+                        {
+                            name = qns.Right;
+                        }
+
+                        var identifier = name.ToString();
+                        return identifier is "Argument" or "ArgumentAttribute";
+                    });
+
+                var isCancellationToken = SymbolEqualityComparer.Default.Equals(type.Type!, wellKnownTypes.CancellationToken);
+                var isConsoleAppContext = type.Type!.Name == "ConsoleAppContext";
+
+                var argumentIndex = -1;
+                if (!(isFromServices || isCancellationToken || isConsoleAppContext))
+                {
+                    if (hasArgument)
+                    {
+                        argumentIndex = argumentIndexCounter++;
+                    }
+                    else
+                    {
+                        parsableIndex++;
+                    }
+                }
+
+                var isNullableReference = x.Type.IsKind(SyntaxKind.NullableType) && type.Type?.OriginalDefinition.SpecialType != SpecialType.System_Nullable_T;
+
+                return new CommandParameter
+                {
+                    Name = generatorOptions.DisableNamingConversion ? x.Identifier.Text : NameConverter.ToKebabCase(x.Identifier.Text),
+                    WellKnownTypes = wellKnownTypes,
+                    OriginalParameterName = x.Identifier.Text,
+                    IsNullableReference = isNullableReference,
+                    IsConsoleAppContext = isConsoleAppContext,
+                    IsParams = hasParams,
+                    IsHidden = isHidden,
+                    IsDefaultValueHidden = isDefaultValueHidden,
+                    Type = new EquatableTypeSymbol(type.Type!),
+                    Location = x.GetLocation(),
+                    HasDefaultValue = hasDefault,
+                    DefaultValue = defaultValue,
+                    CustomParserType = customParserType?.ToEquatable(),
+                    HasValidation = hasValidation,
+                    IsCancellationToken = isCancellationToken,
+                    IsFromServices = isFromServices,
+                    IsFromKeyedServices = isFromKeyedServices,
+                    KeyedServiceKey = keyedServiceKey,
+                    Aliases = [],
+                    Description = "",
+                    ArgumentIndex = argumentIndex,
+                };
+            })
+            .Where(x => x.Type != null)
+            .ToArray();
+
+        var cmd = new Command
+        {
+            Name = commandName,
+            IsAsync = isAsync,
+            IsVoid = isVoid,
+            IsHidden = false, // Anonymous lambda don't support attribute.
+            Parameters = parameters,
+            MethodKind = MethodKind.Lambda,
+            Description = "",
+            DelegateBuildType = delegateBuildType,
+            Filters = globalFilters,
+            IsRequireDynamicDependencyAttribute = false,
+        };
+
+        return cmd;
+    }
+
+    Command? ParseFromMethodSymbol(IMethodSymbol methodSymbol, bool addressOf, string commandName, FilterInfo[] typeFilters)
+    {
+        if (methodSymbol.DeclaringSyntaxReferences.Length == 0)
+        {
+            context.ReportDiagnostic(DiagnosticDescriptors.DefinedInOtherProject, node.GetLocation());
+            return null;
+        }
+
+        var docComment = methodSymbol.DeclaringSyntaxReferences[0].GetSyntax().GetDocumentationCommentTriviaSyntax();
+        var summary = "";
+        Dictionary<string, string>? parameterDescriptions = null;
+        if (docComment != null)
+        {
+            summary = docComment.GetSummary();
+            parameterDescriptions = docComment.GetParams().ToDictionary(x => x.Name, x => x.Description);
+        }
+
+        // allow returnType = void, int, Task, Task<int>
+        var isVoid = false;
+        var isAsync = false;
+        if (methodSymbol.ReturnType.SpecialType == SpecialType.System_Void)
+        {
+            isVoid = true;
+
+            // check `async void`
+            var syntax = methodSymbol.DeclaringSyntaxReferences[0].GetSyntax() as MethodDeclarationSyntax;
+            if (syntax != null)
+            {
+                var asyncKeyword = syntax.Modifiers.FirstOrDefault(x => x.IsKind(SyntaxKind.AsyncKeyword));
+                if (asyncKeyword != default)
+                {
+                    context.ReportDiagnostic(DiagnosticDescriptors.ReturnTypeMethodAsyncVoid, asyncKeyword.GetLocation());
+                    return null;
+                }
+            }
+        }
+        else if (methodSymbol.ReturnType.SpecialType == SpecialType.System_Int32)
+        {
+            isVoid = false;
+        }
+        else if ((methodSymbol.ReturnType as INamedTypeSymbol)!.EqualsUnconstructedGenericType(wellKnownTypes.Task))
+        {
+            isVoid = true;
+            isAsync = true;
+        }
+        else if ((methodSymbol.ReturnType as INamedTypeSymbol)!.EqualsUnconstructedGenericType(wellKnownTypes.Task_T))
+        {
+            var typeArg = (methodSymbol.ReturnType as INamedTypeSymbol)!.TypeArguments[0];
+            if (typeArg.SpecialType == SpecialType.System_Int32)
+            {
+                isVoid = false;
+                isAsync = true;
+            }
+            else
+            {
+                var syntax = methodSymbol.DeclaringSyntaxReferences[0].GetSyntax();
+                var location = syntax switch
+                {
+                    MethodDeclarationSyntax x => x.ReturnType.GetLocation(),
+                    LocalFunctionStatementSyntax x => x.ReturnType.GetLocation(),
+                    _ => node.GetLocation()
+                };
+
+                context.ReportDiagnostic(DiagnosticDescriptors.ReturnTypeMethod, location, methodSymbol.ReturnType);
+                return null;
+            }
+        }
+        else
+        {
+            var syntax = methodSymbol.DeclaringSyntaxReferences[0].GetSyntax();
+            var location = syntax switch
+            {
+                MethodDeclarationSyntax x => x.ReturnType.GetLocation(),
+                LocalFunctionStatementSyntax x => x.ReturnType.GetLocation(),
+                _ => node.GetLocation()
+            };
+
+            context.ReportDiagnostic(DiagnosticDescriptors.ReturnTypeMethod, location, methodSymbol.ReturnType);
+            return null;
+        }
+
+        var isHiddenCommand = methodSymbol.GetAttributes().Any(x => x.AttributeClass?.Name == "HiddenAttribute");
+
+        var methodFilters = methodSymbol.GetAttributes()
+            .Where(x => x.AttributeClass?.Name == "ConsoleAppFilterAttribute")
+            .Select(x =>
+            {
+                var filterType = x.AttributeClass!.TypeArguments[0];
+                var filter = FilterInfo.Create(filterType);
+
+                if (filter == null)
+                {
+                    context.ReportDiagnostic(DiagnosticDescriptors.FilterMultipleConstructor, x.ApplicationSyntaxReference!.GetSyntax().GetLocation());
+                    return null!;
+                }
+
+                return filter;
+            })
+            .ToArray();
+        if (methodFilters.Any(x => x == null))
+        {
+            return null;
+        }
+
+        // validate parameter symbols
+        if (parameterDescriptions != null)
+        {
+            foreach (var item in parameterDescriptions)
+            {
+                if (!methodSymbol.Parameters.Any(x => x.Name == item.Key))
+                {
+                    context.ReportDiagnostic(DiagnosticDescriptors.DocCommentParameterNameNotMatched, methodSymbol.Locations[0], item.Key);
+                    return null;
+                }
+            }
+        }
+
+        var parsableIndex = 0;
+        var argumentIndexCounter = 0;
+        var parameters = methodSymbol.Parameters
+            .Select(x =>
+            {
+                var customParserType = x.GetAttributes().FirstOrDefault(x => x.AttributeClass?.AllInterfaces.Any(y => y.Name == "IArgumentParser") ?? false);
+                var hasFromServices = x.GetAttributes().Any(x => x.AttributeClass?.Name == "FromServicesAttribute");
+                var hasFromKeyedServices = x.GetAttributes().Any(x => x.AttributeClass?.Name == "FromKeyedServicesAttribute");
+                var hasArgument = x.GetAttributes().Any(x => x.AttributeClass?.Name == "ArgumentAttribute");
+                var hasValidation = x.GetAttributes().Any(x => x.AttributeClass?.GetBaseTypes().Any(y => y.Name == "ValidationAttribute") ?? false);
+                var isCancellationToken = SymbolEqualityComparer.Default.Equals(x.Type, wellKnownTypes.CancellationToken);
+                var isConsoleAppContext = x.Type!.Name == "ConsoleAppContext";
+                var isHiddenParameter = x.GetAttributes().Any(x => x.AttributeClass?.Name == "HiddenAttribute");
+                var isDefaultValueHidden = x.GetAttributes().Any(x => x.AttributeClass?.Name == "HideDefaultValueAttribute");
+
+                object? keyedServiceKey = null;
+                if (hasFromKeyedServices)
+                {
+                    var attr = x.GetAttributes().First(x => x.AttributeClass?.Name == "FromKeyedServicesAttribute");
+                    keyedServiceKey = attr.ConstructorArguments[0].Value;
+                }
+
+                string description = "";
+                string[] aliases = [];
+                if (parameterDescriptions != null && parameterDescriptions.TryGetValue(x.Name, out var desc))
+                {
+                    ParseParameterDescription(desc, out aliases, out description);
+                }
+
+                var argumentIndex = -1;
+                if (!(hasFromServices || isCancellationToken))
+                {
+                    if (hasArgument)
+                    {
+                        argumentIndex = argumentIndexCounter++;
+                    }
+                    else
+                    {
+                        parsableIndex++;
+                    }
+                }
+
+                var isNullableReference = x.NullableAnnotation == NullableAnnotation.Annotated && x.Type.OriginalDefinition.SpecialType != SpecialType.System_Nullable_T;
+
+                return new CommandParameter
+                {
+                    Name = generatorOptions.DisableNamingConversion ? x.Name : NameConverter.ToKebabCase(x.Name),
+                    WellKnownTypes = wellKnownTypes,
+                    OriginalParameterName = x.Name,
+                    IsNullableReference = isNullableReference,
+                    IsConsoleAppContext = isConsoleAppContext,
+                    IsParams = x.IsParams,
+                    IsHidden = isHiddenParameter,
+                    IsDefaultValueHidden = isDefaultValueHidden,
+                    Location = x.DeclaringSyntaxReferences[0].GetSyntax().GetLocation(),
+                    Type = new EquatableTypeSymbol(x.Type),
+                    HasDefaultValue = x.HasExplicitDefaultValue,
+                    DefaultValue = x.HasExplicitDefaultValue ? x.ExplicitDefaultValue : null,
+                    CustomParserType = customParserType?.AttributeClass?.ToEquatable(),
+                    IsCancellationToken = isCancellationToken,
+                    IsFromServices = hasFromServices,
+                    IsFromKeyedServices = hasFromKeyedServices,
+                    KeyedServiceKey = keyedServiceKey,
+                    HasValidation = hasValidation,
+                    Aliases = aliases,
+                    ArgumentIndex = argumentIndex,
+                    Description = description
+                };
+            })
+            .ToArray();
+
+        var cmd = new Command
+        {
+            Name = commandName,
+            IsAsync = isAsync,
+            IsVoid = isVoid,
+            IsHidden = isHiddenCommand,
+            Parameters = parameters,
+            MethodKind = addressOf ? MethodKind.FunctionPointer : MethodKind.Method,
+            Description = summary,
+            DelegateBuildType = delegateBuildType,
+            Filters = globalFilters.Concat(typeFilters).Concat(methodFilters).ToArray(),
+            Symbol = new IgnoreEquality<ISymbol>(methodSymbol)
+        };
+
+        return cmd;
+    }
+
+    Command? ValidateCommand(Command command)
+    {
+        var hasDiagnostic = false;
+
+        // Sequential Argument(v5.7.7 support it).
+        //var existsNotArgument = false;
+        //foreach (var parameter in command.Parameters)
+        //{
+        //    if (!parameter.IsParsable) continue;
+
+        //    if (!parameter.IsArgument)
+        //    {
+        //        existsNotArgument = true;
+        //    }
+
+        //    if (parameter.IsArgument && existsNotArgument)
+        //    {
+        //        context.ReportDiagnostic(DiagnosticDescriptors.SequentialArgument, parameter.Location);
+        //        hasDiagnostic = true;
+        //    }
+        //}
+
+        // -h|--help is reserved for help, and option names and aliases must be unique in the command
+        var optionNames = new HashSet<string>();
+        foreach (var p in command.Parameters)
+        {
+            if (!p.IsParsable || p.IsArgument) continue;
+
+            foreach (var name in p.Aliases.Prepend("--" + p.Name))
+            {
+                if (name is "-h" or "--help")
+                {
+                    context.ReportDiagnostic(DiagnosticDescriptors.ReservedHelpOptionName, p.Location, name);
+                    hasDiagnostic = true;
+                    break;
+                }
+
+                if (!optionNames.Add(name))
+                {
+                    context.ReportDiagnostic(DiagnosticDescriptors.DuplicateOptionName, p.Location, name);
+                    hasDiagnostic = true;
+                    break;
+                }
+            }
+        }
+
+        // bool? is treated as a flag(same as bool), warn it
+        foreach (var p in command.Parameters)
+        {
+            if (!p.IsParsable) continue;
+
+            if (p.Type.TypeSymbol is INamedTypeSymbol { OriginalDefinition.SpecialType: SpecialType.System_Nullable_T } nullable
+                && nullable.TypeArguments[0].SpecialType == SpecialType.System_Boolean)
+            {
+                context.ReportDiagnostic(DiagnosticDescriptors.NullableBoolParameter, p.Location, p.OriginalParameterName);
+            }
+        }
+
+        // FunctionPointer can not use validation
+        if (command.MethodKind == MethodKind.FunctionPointer)
+        {
+            foreach (var p in command.Parameters)
+            {
+                if (p.HasValidation)
+                {
+                    context.ReportDiagnostic(DiagnosticDescriptors.FunctionPointerCanNotHaveValidation, p.Location);
+                    hasDiagnostic = true;
+                }
+            }
+        }
+
+        if (hasDiagnostic) return null;
+
+        return command;
+    }
+
+    void ParseParameterDescription(string originalDescription, out string[] aliases, out string description)
+    {
+        // Example:
+        // -i|--input, This is an input.
+
+        var splitOne = originalDescription.Split([','], 2);
+
+        // has alias
+        if (splitOne[0].TrimStart().StartsWith("-"))
+        {
+            aliases = splitOne[0].Split(['|'], StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()).ToArray();
+            description = splitOne.Length > 1 ? splitOne[1].Trim() : string.Empty;
+        }
+        else
+        {
+            aliases = [];
+            description = originalDescription;
+        }
+    }
+}
